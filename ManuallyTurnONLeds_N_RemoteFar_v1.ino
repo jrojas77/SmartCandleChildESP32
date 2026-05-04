@@ -14,6 +14,7 @@ static const char* MDNS_HOSTNAME = "esp32-candle";
 static const char* MDNS_NAME = "esp32-candle.local";
 static const char* ADMIN_BOOTSTRAP_USER = "admin";
 static const char* ADMIN_BOOTSTRAP_PASSWORD = "admin123";
+static const char* CHILD_DEVICE_ID = "child-001";
 
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 static const unsigned long API_SESSION_TTL_MS = 30UL * 60UL * 1000UL;
@@ -28,6 +29,18 @@ const int SIGNAL_PINS[] = {4, 5, 21, 22};
 const int NUM_LEDS = sizeof(LED_PINS) / sizeof(LED_PINS[0]);
 
 const String SIZE_BY_LED[] = {"S", "M", "S", "M"};
+
+struct ChildOwnedGroup {
+  const char* groupId;
+  const char* candleCode;
+  const char* ledSize;
+};
+
+const ChildOwnedGroup CHILD_GROUPS[] = {
+  {"group-saint-a1", "small", "S"},
+  {"group-saint-b1", "medium", "M"}
+};
+const int NUM_CHILD_GROUPS = sizeof(CHILD_GROUPS) / sizeof(CHILD_GROUPS[0]);
 
 bool debugMode = true;
 unsigned long ledTurnDuration = 10000;
@@ -102,6 +115,29 @@ void countCandlesByState(int& s_on, int& s_off, int& m_on, int& m_off, int& l_on
       if (isOn) l_on++; else l_off++;
     }
   }
+}
+
+int countOwnedCapacity(const char* ledSize) {
+  int count = 0;
+  for (int i = 0; i < NUM_LEDS; i++) {
+    if (SIZE_BY_LED[i] == ledSize) count++;
+  }
+  return count;
+}
+
+int countOwnedOccupied(const char* ledSize) {
+  int count = 0;
+  for (int i = 0; i < NUM_LEDS; i++) {
+    if (SIZE_BY_LED[i] == ledSize && ledStates[i]) count++;
+  }
+  return count;
+}
+
+const ChildOwnedGroup* findOwnedGroup(const String& groupId) {
+  for (int i = 0; i < NUM_CHILD_GROUPS; i++) {
+    if (groupId == CHILD_GROUPS[i].groupId) return &CHILD_GROUPS[i];
+  }
+  return nullptr;
 }
 
 void initDefaultConfig() {
@@ -721,6 +757,76 @@ void handleGetAvailableCandle() {
   sendJson(200, json);
 }
 
+void handleInternalRuntime() {
+  StaticJsonDocument<512> doc;
+  doc["deviceId"] = CHILD_DEVICE_ID;
+  doc["status"] = "online_local";
+
+  JsonArray groups = doc.createNestedArray("groups");
+  for (int i = 0; i < NUM_CHILD_GROUPS; i++) {
+    int capacity = countOwnedCapacity(CHILD_GROUPS[i].ledSize);
+    int occupied = countOwnedOccupied(CHILD_GROUPS[i].ledSize);
+    int available = capacity - occupied;
+    if (available < 0) available = 0;
+
+    JsonObject group = groups.createNestedObject();
+    group["groupId"] = CHILD_GROUPS[i].groupId;
+    group["candleCode"] = CHILD_GROUPS[i].candleCode;
+    group["capacity"] = capacity;
+    group["occupied"] = occupied;
+    group["available"] = available;
+    group["runtimeStatus"] = processingRequest ? "busy" : "ready";
+  }
+
+  String json;
+  serializeJson(doc, json);
+  sendJson(200, json);
+}
+
+void handleInternalExecute() {
+  if (!server.hasArg("plain")) {
+    sendJson(400, "{\"error\":\"Missing body\"}");
+    return;
+  }
+
+  StaticJsonDocument<256> doc;
+  DeserializationError error = deserializeJson(doc, server.arg("plain"));
+  if (error) {
+    sendJson(400, "{\"error\":\"Invalid JSON\"}");
+    return;
+  }
+
+  String localExecutionId = doc["localExecutionId"] | "";
+  String groupId = doc["groupId"] | "";
+  String candleCode = doc["candleCode"] | "";
+  int quantity = doc["quantity"] | 0;
+
+  if (localExecutionId.length() == 0 || groupId.length() == 0 || candleCode.length() == 0 || quantity <= 0) {
+    sendJson(400, "{\"error\":\"Missing or invalid execution fields\"}");
+    return;
+  }
+
+  const ChildOwnedGroup* group = findOwnedGroup(groupId);
+  if (group == nullptr || candleCode != group->candleCode) {
+    sendJson(404, "{\"error\":\"Group not owned by child\"}");
+    return;
+  }
+
+  int capacity = countOwnedCapacity(group->ledSize);
+  if (quantity > capacity) {
+    sendJson(409, "{\"error\":\"Quantity exceeds child group capacity\"}");
+    return;
+  }
+
+  StaticJsonDocument<128> response;
+  response["status"] = "accepted";
+  response["localExecutionId"] = localExecutionId;
+
+  String json;
+  serializeJson(response, json);
+  sendJson(200, json);
+}
+
 // -----------------------------
 // Setup and loop
 // -----------------------------
@@ -765,6 +871,8 @@ void setup() {
   server.on("/Config", HTTP_POST, handleSetConfig);
   server.on("/Statusrequest", HTTP_GET, handleStatusRequest);
   server.on("/GetAvailableCandle", HTTP_GET, handleGetAvailableCandle);
+  server.on("/internal/runtime", HTTP_GET, handleInternalRuntime);
+  server.on("/internal/execute", HTTP_POST, handleInternalExecute);
 
   server.begin();
   debugLog("HTTP server started");
